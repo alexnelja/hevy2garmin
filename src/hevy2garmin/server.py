@@ -1318,6 +1318,22 @@ async def api_unsync_all(request: Request):
     return JSONResponse({"ok": True, "count": count})
 
 
+@app.post("/api/scan-duplicates", response_class=HTMLResponse)
+async def api_scan_duplicates(request: Request):
+    """On-demand: scan recent workouts for duplicate tool+watch activity pairs
+    and show the count. Log-only, no deletion."""
+    from hevy2garmin.reconcile import detect_duplicates
+    from hevy2garmin.sync import fetch_workouts, _hr_limiter
+    from hevy2garmin.hevy import HevyClient
+    from hevy2garmin.garmin import get_client
+    cfg = load_config()
+    hevy = HevyClient(api_key=cfg.get("hevy_api_key"))
+    garmin_client = get_client(cfg.get("garmin_email"))
+    workouts = fetch_workouts(hevy, limit=50)
+    dups = detect_duplicates(garmin_client, workouts, _hr_limiter)
+    return HTMLResponse(f"<div>Found {len(dups)} possible duplicate(s). See server logs for details.</div>")
+
+
 @app.post("/api/toggle-autosync", response_class=HTMLResponse)
 async def api_toggle_autosync(request: Request):
     if is_demo_mode():
