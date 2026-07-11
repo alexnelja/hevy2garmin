@@ -79,6 +79,25 @@ class PostgresDatabase(Database):
                     )
                 """)
                 cur.execute("""
+                    CREATE TABLE IF NOT EXISTS pending_uploads (
+                        hevy_id TEXT PRIMARY KEY,
+                        phase TEXT NOT NULL,
+                        next_step TEXT,
+                        upload_id TEXT,
+                        garmin_activity_id TEXT,
+                        watch_activity_id TEXT,
+                        pre_upload_ids JSONB NOT NULL DEFAULT '[]',
+                        payload JSONB NOT NULL DEFAULT '{}',
+                        resolution_source TEXT,
+                        attempt_count INTEGER NOT NULL DEFAULT 0,
+                        delete_attempt_count INTEGER NOT NULL DEFAULT 0,
+                        last_error TEXT,
+                        locked_until TIMESTAMPTZ,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                """)
+                cur.execute("""
                     CREATE TABLE IF NOT EXISTS platform_credentials (
                         platform VARCHAR(50) PRIMARY KEY,
                         auth_type VARCHAR(20) NOT NULL DEFAULT 'oauth',
@@ -95,16 +114,11 @@ class PostgresDatabase(Database):
                         subcategory INTEGER NOT NULL DEFAULT 0
                     )
                 """)
-                # Migration: add hevy_updated_at if missing
-                try:
-                    cur.execute("ALTER TABLE synced_workouts ADD COLUMN hevy_updated_at TEXT")
-                except Exception:
-                    conn.rollback()
-                # Migration: add sync_method column (merge mode)
-                try:
-                    cur.execute("ALTER TABLE synced_workouts ADD COLUMN sync_method TEXT DEFAULT 'upload'")
-                except Exception:
-                    conn.rollback()
+                cur.execute("ALTER TABLE synced_workouts ADD COLUMN IF NOT EXISTS hevy_updated_at TEXT")
+                cur.execute("ALTER TABLE synced_workouts ADD COLUMN IF NOT EXISTS sync_method TEXT DEFAULT 'upload'")
+                cur.execute("ALTER TABLE synced_workouts ADD COLUMN IF NOT EXISTS resolution_reason TEXT")
+                cur.execute("ALTER TABLE synced_workouts ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ")
+                cur.execute("ALTER TABLE synced_workouts ADD COLUMN IF NOT EXISTS resolution_source TEXT")
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS app_cache (
                         key TEXT PRIMARY KEY,
@@ -165,6 +179,7 @@ class PostgresDatabase(Database):
                         avg_hr = EXCLUDED.avg_hr,
                         hevy_updated_at = EXCLUDED.hevy_updated_at,
                         sync_method = EXCLUDED.sync_method,
+                        status = 'success',
                         synced_at = NOW()
                     """,
                     (hevy_id, garmin_activity_id, title, calories, avg_hr, hevy_updated_at, sync_method),
@@ -287,6 +302,91 @@ class PostgresDatabase(Database):
                     """,
                     (key, json.dumps(value)),
                 )
+            conn.commit()
+
+    def claim_pending(self, hevy_id: str, payload: dict) -> bool:
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO pending_uploads (hevy_id, phase, payload)
+                    VALUES (%s, 'preparing', %s) ON CONFLICT (hevy_id) DO NOTHING
+                """, (hevy_id, json.dumps(payload)))
+                claimed = cur.rowcount == 1
+            conn.commit()
+        return claimed
+
+    @staticmethod
+    def _pending_dict(row) -> dict:
+        result = dict(row)
+        for key, empty in (("pre_upload_ids", []), ("payload", {})):
+            if isinstance(result.get(key), str):
+                result[key] = json.loads(result[key])
+            elif result.get(key) is None:
+                result[key] = empty
+        return result
+
+    def get_pending(self, hevy_id: str) -> dict | None:
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM pending_uploads WHERE hevy_id=%s", (hevy_id,))
+                row = cur.fetchone()
+                return self._pending_dict(row) if row else None
+
+    def list_pending(self) -> list[dict]:
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM pending_uploads ORDER BY created_at DESC")
+                return [self._pending_dict(row) for row in cur.fetchall()]
+
+    def update_pending(self, hevy_id: str, **changes) -> None:
+        allowed = {"phase", "next_step", "upload_id", "garmin_activity_id", "watch_activity_id", "pre_upload_ids", "payload", "resolution_source", "attempt_count", "delete_attempt_count", "last_error", "locked_until"}
+        changes = {k: v for k, v in changes.items() if k in allowed}
+        if not changes:
+            return
+        for key in ("pre_upload_ids", "payload"):
+            if key in changes:
+                changes[key] = json.dumps(changes[key])
+        assignments = ", ".join(f"{key}=%s" for key in changes)
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"UPDATE pending_uploads SET {assignments}, updated_at=NOW() WHERE hevy_id=%s", (*changes.values(), hevy_id))
+            conn.commit()
+
+    def delete_pending(self, hevy_id: str) -> bool:
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM pending_uploads WHERE hevy_id=%s", (hevy_id,)); deleted = cur.rowcount > 0
+            conn.commit()
+        return deleted
+
+    def complete_pending(self, hevy_id: str, terminal: dict) -> None:
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO synced_workouts
+                      (hevy_id, garmin_activity_id, title, calories, avg_hr, hevy_updated_at, sync_method, status)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,'success')
+                    ON CONFLICT (hevy_id) DO UPDATE SET garmin_activity_id=EXCLUDED.garmin_activity_id,
+                      title=EXCLUDED.title, calories=EXCLUDED.calories, avg_hr=EXCLUDED.avg_hr,
+                      hevy_updated_at=EXCLUDED.hevy_updated_at, sync_method=EXCLUDED.sync_method,
+                      status='success', synced_at=NOW()
+                """, (hevy_id, terminal.get("garmin_activity_id"), terminal.get("title", ""), terminal.get("calories"), terminal.get("avg_hr"), terminal.get("hevy_updated_at"), terminal.get("sync_method", "upload")))
+                cur.execute("DELETE FROM pending_uploads WHERE hevy_id=%s", (hevy_id,))
+            conn.commit()
+
+    def resolve_terminal(self, hevy_id: str, *, status: str, garmin_activity_id: str | None = None, reason: str | None = None, source: str | None = None) -> None:
+        if status not in {"manual", "skipped"}:
+            raise ValueError("manual resolution status must be manual or skipped")
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO synced_workouts (hevy_id, garmin_activity_id, status, resolution_reason, resolved_at, resolution_source)
+                    VALUES (%s,%s,%s,%s,NOW(),%s)
+                    ON CONFLICT (hevy_id) DO UPDATE SET garmin_activity_id=EXCLUDED.garmin_activity_id,
+                      status=EXCLUDED.status, resolution_reason=EXCLUDED.resolution_reason,
+                      resolved_at=NOW(), resolution_source=EXCLUDED.resolution_source, synced_at=NOW()
+                """, (hevy_id, garmin_activity_id, status, reason, source))
+                cur.execute("DELETE FROM pending_uploads WHERE hevy_id=%s", (hevy_id,))
             conn.commit()
 
     def get_custom_mappings(self) -> dict[str, tuple[int, int]]:

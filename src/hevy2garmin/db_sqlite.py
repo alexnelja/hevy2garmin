@@ -64,6 +64,31 @@ class SQLiteDatabase(Database):
                 trigger TEXT DEFAULT 'manual'
             )
         """)
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS pending_uploads (
+                hevy_id TEXT PRIMARY KEY,
+                phase TEXT NOT NULL,
+                next_step TEXT,
+                upload_id TEXT,
+                garmin_activity_id TEXT,
+                watch_activity_id TEXT,
+                pre_upload_ids TEXT NOT NULL DEFAULT '[]',
+                payload TEXT NOT NULL DEFAULT '{}',
+                resolution_source TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                delete_attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                locked_until TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+            """)
+        except sqlite3.OperationalError as exc:
+            # A legacy database may intentionally be mounted read-only for
+            # status/dashboard views. Reads remain backward compatible.
+            if "readonly" not in str(exc).lower():
+                raise
         conn.execute("""
             CREATE TABLE IF NOT EXISTS hr_cache (
                 hevy_id TEXT PRIMARY KEY,
@@ -81,6 +106,15 @@ class SQLiteDatabase(Database):
             conn.execute("ALTER TABLE synced_workouts ADD COLUMN sync_method TEXT DEFAULT 'upload'")
         except Exception:
             pass  # Column already exists
+        for column, definition in (
+            ("resolution_reason", "TEXT"),
+            ("resolved_at", "TEXT"),
+            ("resolution_source", "TEXT"),
+        ):
+            try:
+                conn.execute(f"ALTER TABLE synced_workouts ADD COLUMN {column} {definition}")
+            except sqlite3.OperationalError:
+                pass
         conn.execute("""
             CREATE TABLE IF NOT EXISTS app_cache (
                 key TEXT PRIMARY KEY,
@@ -121,8 +155,14 @@ class SQLiteDatabase(Database):
         conn = self._get_conn()
         conn.execute(
             """
-            INSERT OR REPLACE INTO synced_workouts (hevy_id, garmin_activity_id, title, calories, avg_hr, hevy_updated_at, sync_method)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO synced_workouts (hevy_id, garmin_activity_id, title, calories, avg_hr, hevy_updated_at, sync_method, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'success')
+            ON CONFLICT(hevy_id) DO UPDATE SET
+                garmin_activity_id=excluded.garmin_activity_id,
+                title=excluded.title, calories=excluded.calories,
+                avg_hr=excluded.avg_hr, hevy_updated_at=excluded.hevy_updated_at,
+                sync_method=excluded.sync_method, status='success',
+                synced_at=datetime('now')
             """,
             (hevy_id, garmin_activity_id, title, calories, avg_hr, hevy_updated_at, sync_method),
         )
@@ -243,3 +283,80 @@ class SQLiteDatabase(Database):
         )
         conn.commit()
         conn.close()
+
+    def claim_pending(self, hevy_id: str, payload: dict) -> bool:
+        conn = self._get_conn()
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO pending_uploads (hevy_id, phase, payload) VALUES (?, 'preparing', ?)",
+            (hevy_id, json.dumps(payload)),
+        )
+        claimed = cur.rowcount == 1
+        conn.commit()
+        conn.close()
+        return claimed
+
+    @staticmethod
+    def _pending_dict(row: sqlite3.Row) -> dict:
+        result = dict(row)
+        result["pre_upload_ids"] = json.loads(result.get("pre_upload_ids") or "[]")
+        result["payload"] = json.loads(result.get("payload") or "{}")
+        return result
+
+    def get_pending(self, hevy_id: str) -> dict | None:
+        conn = self._get_conn(); conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM pending_uploads WHERE hevy_id=?", (hevy_id,)).fetchone()
+        conn.close()
+        return self._pending_dict(row) if row else None
+
+    def list_pending(self) -> list[dict]:
+        conn = self._get_conn(); conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM pending_uploads ORDER BY created_at DESC").fetchall()
+        conn.close()
+        return [self._pending_dict(row) for row in rows]
+
+    def update_pending(self, hevy_id: str, **changes) -> None:
+        allowed = {"phase", "next_step", "upload_id", "garmin_activity_id", "watch_activity_id", "pre_upload_ids", "payload", "resolution_source", "attempt_count", "delete_attempt_count", "last_error", "locked_until"}
+        changes = {k: v for k, v in changes.items() if k in allowed}
+        if not changes:
+            return
+        for key in ("pre_upload_ids", "payload"):
+            if key in changes:
+                changes[key] = json.dumps(changes[key])
+        assignments = ", ".join(f"{key}=?" for key in changes)
+        conn = self._get_conn()
+        conn.execute(f"UPDATE pending_uploads SET {assignments}, updated_at=datetime('now') WHERE hevy_id=?", (*changes.values(), hevy_id))
+        conn.commit(); conn.close()
+
+    def delete_pending(self, hevy_id: str) -> bool:
+        conn = self._get_conn(); cur = conn.execute("DELETE FROM pending_uploads WHERE hevy_id=?", (hevy_id,))
+        conn.commit(); conn.close(); return cur.rowcount > 0
+
+    def complete_pending(self, hevy_id: str, terminal: dict) -> None:
+        conn = self._get_conn()
+        conn.execute("""
+            INSERT INTO synced_workouts
+              (hevy_id, garmin_activity_id, title, calories, avg_hr, hevy_updated_at, sync_method, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'success')
+            ON CONFLICT(hevy_id) DO UPDATE SET
+              garmin_activity_id=excluded.garmin_activity_id, title=excluded.title,
+              calories=excluded.calories, avg_hr=excluded.avg_hr,
+              hevy_updated_at=excluded.hevy_updated_at, sync_method=excluded.sync_method,
+              status='success', synced_at=datetime('now')
+        """, (hevy_id, terminal.get("garmin_activity_id"), terminal.get("title", ""), terminal.get("calories"), terminal.get("avg_hr"), terminal.get("hevy_updated_at"), terminal.get("sync_method", "upload")))
+        conn.execute("DELETE FROM pending_uploads WHERE hevy_id=?", (hevy_id,))
+        conn.commit(); conn.close()
+
+    def resolve_terminal(self, hevy_id: str, *, status: str, garmin_activity_id: str | None = None, reason: str | None = None, source: str | None = None) -> None:
+        if status not in {"manual", "skipped"}:
+            raise ValueError("manual resolution status must be manual or skipped")
+        conn = self._get_conn()
+        conn.execute("""
+            INSERT INTO synced_workouts (hevy_id, garmin_activity_id, status, resolution_reason, resolved_at, resolution_source)
+            VALUES (?, ?, ?, ?, datetime('now'), ?)
+            ON CONFLICT(hevy_id) DO UPDATE SET garmin_activity_id=excluded.garmin_activity_id,
+              status=excluded.status, resolution_reason=excluded.resolution_reason,
+              resolved_at=datetime('now'), resolution_source=excluded.resolution_source,
+              synced_at=datetime('now')
+        """, (hevy_id, garmin_activity_id, status, reason, source))
+        conn.execute("DELETE FROM pending_uploads WHERE hevy_id=?", (hevy_id,))
+        conn.commit(); conn.close()

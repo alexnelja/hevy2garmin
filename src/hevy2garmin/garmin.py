@@ -19,6 +19,10 @@ logger = logging.getLogger("hevy2garmin")
 _limiter = RateLimiter(delay=1.0, max_retries=3, base_wait=30)
 
 
+class GarminUploadRejected(RuntimeError):
+    """Garmin definitively rejected an import without accepting an activity."""
+
+
 def get_client(
     email: str | None = None,
     password: str | None = None,
@@ -111,6 +115,8 @@ def upload_fit(client: Garmin, fit_path: str | Path, workout_start: str | None =
         failures = detail.get("failures", [])
         if failures:
             logger.warning("  Upload failures: %s", failures)
+            if not activity_id and not successes:
+                raise GarminUploadRejected(f"Garmin rejected upload: {failures}")
         logger.info("  Upload result: upload_id=%s activity_id=%s", upload_id, activity_id)
     else:
         logger.info("  Upload response: %s", str(resp)[:200])
@@ -132,6 +138,23 @@ def upload_fit(client: Garmin, fit_path: str | Path, workout_start: str | None =
         logger.warning("  Could not find activity ID after upload. Workout will appear as 'Strength Training' on Garmin.")
 
     return {"upload_id": upload_id, "activity_id": activity_id}
+
+
+def activities_for_workout(client: Garmin, workout: dict) -> list[dict]:
+    """Fetch all Garmin activities in the workout's conservative date window."""
+    from datetime import datetime, timedelta
+
+    start_raw = workout.get("start_time") or workout.get("startTime", "")
+    end_raw = workout.get("end_time") or workout.get("endTime", "") or start_raw
+    try:
+        start = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
+        end = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        raise ValueError("workout has no valid time window")
+    date_from = (start - timedelta(days=1)).date().isoformat()
+    date_to = (end + timedelta(days=1)).date().isoformat()
+    activities = _limiter.call(client.get_activities_by_date, date_from, date_to)
+    return list(activities or [])
 
 
 def find_activity_by_start_time(
